@@ -4,6 +4,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.JoinPoint;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.*;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.Arrays;
@@ -17,6 +18,9 @@ import java.util.Arrays;
 @Component
 @Slf4j
 public class LoggingAspect {
+
+    @Value("${app.logging.slow-call-threshold-ms:500}")
+    private long slowCallThresholdMs;
 
     /**
      * Pointcut for all public methods in service layer.
@@ -39,49 +43,53 @@ public class LoggingAspect {
     public void exceptionHandlerMethods() {
     }
 
-    /**
-     * Logs method entry and exit with execution time for service methods.
-     */
     @Around("serviceMethods()")
     public Object logServiceMethod(ProceedingJoinPoint joinPoint) throws Throwable {
         String className = joinPoint.getTarget().getClass().getSimpleName();
         String methodName = joinPoint.getSignature().getName();
-        Object[] args = joinPoint.getArgs();
-
-        log.info(">>> {}.{}() called with args: {}", className, methodName, formatArgs(args));
-
-        long start = System.currentTimeMillis();
+        long startNs = System.nanoTime();
         try {
             Object result = joinPoint.proceed();
-            long elapsed = System.currentTimeMillis() - start;
-            log.info("<<< {}.{}() returned in {}ms", className, methodName, elapsed);
+            long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+            if (elapsedMs >= slowCallThresholdMs) {
+                log.warn("Slow service call: {}.{} took {}ms", className, methodName, elapsedMs);
+            } else if (log.isDebugEnabled()) {
+                log.debug("Service call: {}.{} took {}ms", className, methodName, elapsedMs);
+            }
             return result;
-        } catch (Exception ex) {
-            long elapsed = System.currentTimeMillis() - start;
-            log.warn("<!> {}.{}() threw {} after {}ms: {}",
-                    className, methodName, ex.getClass().getSimpleName(), elapsed, ex.getMessage());
+        } catch (Throwable ex) {
+            long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+            log.error("Service call failed: {}.{} after {}ms ({})",
+                    className, methodName, elapsedMs, ex.getClass().getSimpleName(), ex);
             throw ex;
         }
     }
 
-    /**
-     * Logs incoming HTTP requests at controller level.
-     */
-    @Before("controllerMethods()")
-    public void logControllerEntry(JoinPoint joinPoint) {
+    @Around("controllerMethods()")
+    public Object logControllerMethod(ProceedingJoinPoint joinPoint) throws Throwable {
+        String className = joinPoint.getTarget().getClass().getSimpleName();
         String methodName = joinPoint.getSignature().getName();
-        Object[] args = joinPoint.getArgs();
-        log.debug("HTTP -> {}() args: {}", methodName, formatArgs(args));
+        long startNs = System.nanoTime();
+        try {
+            Object result = joinPoint.proceed();
+            long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+            if (log.isDebugEnabled()) {
+                log.debug("HTTP handled: {}.{} in {}ms", className, methodName, elapsedMs);
+            }
+            return result;
+        } catch (Throwable ex) {
+            long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
+            log.error("HTTP handling failed: {}.{} after {}ms ({})",
+                    className, methodName, elapsedMs, ex.getClass().getSimpleName(), ex);
+            throw ex;
+        }
     }
 
-    /**
-     * Logs exception handler invocations.
-     */
     @Before("exceptionHandlerMethods()")
     public void logExceptionHandling(JoinPoint joinPoint) {
         Object[] args = joinPoint.getArgs();
         if (args.length > 0 && args[0] instanceof Exception ex) {
-            log.error("Exception handled: [{}] {}", ex.getClass().getSimpleName(), ex.getMessage());
+            log.warn("Exception mapped by handler: [{}] {}", ex.getClass().getSimpleName(), ex.getMessage());
         }
     }
 
